@@ -5,9 +5,10 @@ authors = ["Benjamin Saunders <ben.e.saunders@gmail.com>"]
 
 [dependencies]
 clap = "2.26"
-indicatif = "0.8"
-gpgme = "0.6"
-error-chain = "0.11"
-futures = "0.1.16"
-futures-cpupool = "0.1.7"
-zstd = "0.4.16"
+yapb = "0.3"
+termion = "1.5"
+failure = "0.1"
+rayon = "0.9"
+rdedup-lib = { git = "https://github.com/dpc/rdedup.git" }
+url = "1.6"
+rpassword = "2"
