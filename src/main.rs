@@ -251,12 +251,18 @@ fn scan(errs: mpsc::SyncSender<Error>, dir: &Path) -> ScanStats {
         .sum()
 }
 
+struct Meta {
+    entry: walkdir::DirEntry,
+    offset: u64,
+    len: u64,
+}
+
 struct DataReader {
     iter: walkdir::IntoIter,
-    file: Option<fs::File>,
+    file: Option<(fs::File, Meta)>,
     bytes: Arc<AtomicU64>,
     errors: mpsc::SyncSender<Error>,
-    meta: mpsc::SyncSender<(walkdir::DirEntry, u64)>,
+    meta: mpsc::SyncSender<Meta>,
 }
 
 struct ReadStatus {
@@ -300,22 +306,36 @@ impl Read for DataReader {
                             self.errors.send(format_err!("ignoring non-unicode path {}", x.path().display())).unwrap();
                             continue;
                         }
-                        if x.file_type().is_file() {
-                            match fs::File::open(x.path())
-                                .with_context(|_| format_err!("failed to open {}", x.path().display()))
+                        let meta = Meta {
+                            entry: x,
+                            offset: self.bytes.load(Ordering::Relaxed),
+                            len: 0,
+                        };
+                        if meta.entry.file_type().is_file() {
+                            match fs::File::open(meta.entry.path())
+                                .with_context(|_| format_err!("failed to open {}", meta.entry.path().display()))
                             {
                                 Err(e) => { self.errors.send(e.into()).unwrap(); }
-                                Ok(x) => { self.file = Some(x); }
+                                Ok(f) => { self.file = Some((f, meta)); }
                             }
+                        } else {
+                            self.meta.send(meta).unwrap();
                         }
-                        self.meta.send((x, self.bytes.load(Ordering::Relaxed))).unwrap();
                     }
                 }
             }
 
-            match self.file.as_mut().unwrap().read(buf) {
-                Ok(0) => { self.file = None; }
-                Ok(n) => { self.bytes.fetch_add(n as u64, Ordering::Relaxed); return Ok(n); }
+            match self.file.as_mut().unwrap().0.read(buf) {
+                Ok(0) => {
+                    let (_, meta) = self.file.take().unwrap();
+                    self.meta.send(meta).unwrap();
+                }
+                Ok(n) => {
+                    self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    self.file.as_mut().unwrap().1.len += n as u64;
+                    return Ok(n);
+                }
+                // We deliberately don't yield metadata for files with read errors.
                 Err(e) => { self.errors.send(e.into()).unwrap(); self.file = None; }
             }
         }
@@ -324,7 +344,7 @@ impl Read for DataReader {
 
 struct MetaReader {
     base_depth: usize,
-    meta: mpsc::Receiver<(walkdir::DirEntry, u64)>,
+    meta: mpsc::Receiver<Meta>,
     cursor: u64,
     buffer: io::Cursor<Vec<u8>>,
     dirs: Vec<(Box<[u8]>, Vec<meta::Entry>)>,
@@ -341,17 +361,17 @@ impl Read for MetaReader {
             }
             self.buffer.set_position(0);
             self.buffer.get_mut().clear();
-            let (x, data_offset) = match self.meta.recv() {
+            let x = match self.meta.recv() {
                 Err(mpsc::RecvError) => { assert!(self.dirs.is_empty(), "wrote all metadata"); return Ok(0); }
                 Ok(x) => x,
             };
             //eprintln!("processing {}", x.path().display());
-            if x.depth() > self.dirs.len() {
+            if x.entry.depth() > self.dirs.len() {
                 let prior_depth = self.dirs.len();
                 //eprintln!("depth: base {}, prior {}, new {}", self.base_depth, prior_depth, x.depth());
-                self.dirs.extend(x.path().iter()
+                self.dirs.extend(x.entry.path().iter()
                                  .skip(self.base_depth + prior_depth)
-                                 .take(x.depth() - prior_depth)
+                                 .take(x.entry.depth() - prior_depth)
                                  .map(|x| (x.to_str().unwrap().as_bytes().to_vec().into_boxed_slice(), Vec::new())));
                 // eprint!("new dir:");
                 // for dir in &self.dirs {
@@ -359,8 +379,8 @@ impl Read for MetaReader {
                 // }
                 // eprintln!("");
             }
-            if x.file_type().is_dir() {
-                let files = if self.dirs.len() > x.depth() {
+            if x.entry.file_type().is_dir() {
+                let files = if self.dirs.len() > x.entry.depth() {
                     let (_, entries) = self.dirs.pop().unwrap();
                     for entry in &entries {
                         bincode::serialize_into(&mut self.buffer, entry, bincode::Infinite).unwrap();
@@ -368,7 +388,7 @@ impl Read for MetaReader {
                     entries.len() as u64
                 } else { 0 };
                 let meta = meta::Entry {
-                    name: x.file_name().to_str().unwrap().as_bytes().to_vec().into_boxed_slice(),
+                    name: x.entry.file_name().to_str().unwrap().as_bytes().to_vec().into_boxed_slice(),
                     data: meta::Data::Directory { offset: self.cursor, files }
                 };
                 if let Some(x) = self.dirs.last_mut() {
@@ -377,11 +397,11 @@ impl Read for MetaReader {
                     bincode::serialize_into(&mut self.buffer, &meta, bincode::Infinite).unwrap()
                 }
                 self.buffer.set_position(0);
-            } else if x.path_is_symlink() {
-                match fs::read_link(x.path())
-                    .map_err(|e| e.context(format_err!("failed following symlink {}", x.path().display())).into())
+            } else if x.entry.path_is_symlink() {
+                match fs::read_link(x.entry.path())
+                    .map_err(|e| e.context(format_err!("failed following symlink {}", x.entry.path().display())).into())
                     .and_then(|path| path.to_str()
-                              .ok_or_else(|| format_err!("ignoring non-unicode-targeted symlink {}", x.path().display()))
+                              .ok_or_else(|| format_err!("ignoring non-unicode-targeted symlink {}", x.entry.path().display()))
                               .map(|x| x.as_bytes().to_vec().into_boxed_slice()))
                 {
                     Err(e) => {
@@ -389,15 +409,15 @@ impl Read for MetaReader {
                     }
                     Ok(target) => {
                         self.dirs.last_mut().unwrap().1.push(meta::Entry {
-                            name: x.file_name().to_str().unwrap().as_bytes().to_vec().into_boxed_slice(),
+                            name: x.entry.file_name().to_str().unwrap().as_bytes().to_vec().into_boxed_slice(),
                             data: meta::Data::Link { target },
                         });
                     }
                 };
             } else {
                 self.dirs.last_mut().unwrap().1.push(meta::Entry {
-                    name: x.file_name().to_str().unwrap().as_bytes().to_vec().into_boxed_slice(),
-                    data: meta::Data::Regular { offset: data_offset },
+                    name: x.entry.file_name().to_str().unwrap().as_bytes().to_vec().into_boxed_slice(),
+                    data: meta::Data::Regular { offset: x.offset, len: x.len },
                 });
             }
         }

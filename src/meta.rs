@@ -8,6 +8,7 @@ pub struct Entry {
 pub enum Data {
     Regular {
         offset: u64,
+        len: u64,
     },
     Link {
         target: Box<[u8]>,
