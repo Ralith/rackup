@@ -62,14 +62,12 @@ fn main() {
              .help("rdedup repository URL to write to")
              .required(true)
              .validator(|x| Url::parse(&x).map(|_| ()).map_err(|x| x.to_string())))
+        .arg(Arg::with_name("NAME")
+             .required(true)
+             .help("rdedup name to write to"))
         .arg(Arg::with_name("SOURCE")
              .help("location of data to back up")
              .default_value("."))
-        .arg(Arg::with_name("NAME")
-             .long("name")
-             .short("n")
-             .help("rdedup name to write to")
-             .default_value("backup"))
         .get_matches();
 
     if let Err(e) = run(args) {
