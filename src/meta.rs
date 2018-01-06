@@ -1,17 +1,16 @@
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct File {
-    pub name: Vec<u8>,
-    pub meta: Data,
+pub struct Entry {
+    pub name: Box<[u8]>,
+    pub data: Data,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Data {
     Regular {
         offset: u64,
-        length: u64,
     },
     Link {
-        target: Vec<u8>,
+        target: Box<[u8]>,
     },
     Directory {
         offset: u64,
