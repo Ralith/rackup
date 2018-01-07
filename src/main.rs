@@ -21,7 +21,7 @@ use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use clap::{Arg, App};
+use clap::{App, AppSettings, SubCommand, Arg};
 use yapb::{Spinner, Progress};
 use failure::{Fail, Error, ResultExt};
 use url::Url;
@@ -55,6 +55,7 @@ impl ErrorExt for Error {
 
 fn main() {
     let args = App::new("rackup")
+        .setting(AppSettings::SubcommandRequired)
         .version("0.1")
         .author("Benjamin Saunders <ben.e.saunders@gmail.com>")
         .about("A back-up tool")
@@ -64,10 +65,17 @@ fn main() {
              .validator(|x| Url::parse(&x).map(|_| ()).map_err(|x| x.to_string())))
         .arg(Arg::with_name("NAME")
              .required(true)
-             .help("rdedup name to write to"))
-        .arg(Arg::with_name("SOURCE")
-             .help("location of data to back up")
-             .default_value("."))
+             .help("rdedup name to operate on"))
+        .subcommand(SubCommand::with_name("store").about("Create a new backup")
+                    .arg(Arg::with_name("SOURCE")
+                         .help("location of data to back up")
+                         .default_value(".")))
+        .subcommand(SubCommand::with_name("ls").about("Access metadata for a path in an existing backup")
+                    .arg(Arg::with_name("PATH")
+                         .help("path within the backup to inspect")))
+        .subcommand(SubCommand::with_name("cat").about("Read a single file in an existing backup")
+                    .arg(Arg::with_name("PATH")
+                         .help("path within the backup to read")))
         .get_matches();
 
     if let Err(e) = run(args) {
@@ -77,11 +85,21 @@ fn main() {
 }
 
 fn run<'a>(args: clap::ArgMatches<'a>) -> Result<()> {
+    let repo = rdedup::Repo::open(&Url::parse(args.value_of("REPO").unwrap()).unwrap(), None)
+        .context("failed to open rdedup repo")?;
+    let name = args.value_of("NAME").unwrap().to_owned();
+    match args.subcommand() {
+        ("store", Some(args)) => store(repo, name, args),
+        ("ls", Some(args)) => list(repo, name, args),
+        ("cat", _) => unimplemented!(),
+        _ => unreachable!(),
+    }
+}
+
+fn store<'a>(repo: rdedup::Repo, name: String, args: &clap::ArgMatches<'a>) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
-    let repo = Arc::new(rdedup::Repo::open(&Url::parse(args.value_of("REPO").unwrap()).unwrap(), None)
-                        .context("failed to open rdedup repo")?);
     let encrypt = Arc::new(
         repo.unlock_encrypt(&|| {
             println!("Enter passprase: ");
@@ -127,14 +145,14 @@ fn run<'a>(args: clap::ArgMatches<'a>) -> Result<()> {
     };
 
     let start_time = Instant::now();
-    let data_name = args.value_of("NAME").unwrap().to_owned();
-    let meta_name = data_name.clone() + "-meta";
+    let meta_name = name.clone() + "-meta";
     let (mut data_reader, status, mut meta_reader) = DataReader::new(&source);
+    let repo = Arc::new(repo);
     let data_thread = {
         let repo = repo.clone();
         let encrypt = encrypt.clone();
         thread::spawn(move || -> Result<(u64, usize)> {
-            let stats = repo.write(&data_name, &mut data_reader, &encrypt)?;
+            let stats = repo.write(&name, &mut data_reader, &encrypt)?;
             Ok((stats.new_bytes, stats.new_chunks))
         })
     };
@@ -387,14 +405,13 @@ impl Read for MetaReader {
                     }
                     entries.len() as u64
                 } else { 0 };
-                let meta = meta::Entry {
-                    name: x.entry.file_name().to_str().unwrap().as_bytes().to_vec().into_boxed_slice(),
-                    data: meta::Data::Directory { offset: self.cursor, files }
-                };
-                if let Some(x) = self.dirs.last_mut() {
-                    x.1.push(meta)
+                if let Some(dir) = self.dirs.last_mut() {
+                    dir.1.push(meta::Entry {
+                        name: x.entry.file_name().to_str().unwrap().as_bytes().to_vec().into_boxed_slice(),
+                        data: meta::Data::Directory { offset: self.cursor, files }
+                    });
                 } else {
-                    bincode::serialize_into(&mut self.buffer, &meta, bincode::Infinite).unwrap()
+                    bincode::serialize_into(&mut self.buffer, &(self.cursor, files), bincode::Infinite).unwrap()
                 }
                 self.buffer.set_position(0);
             } else if x.entry.path_is_symlink() {
@@ -420,6 +437,62 @@ impl Read for MetaReader {
                     data: meta::Data::Regular { offset: x.offset, len: x.len },
                 });
             }
+        }
+    }
+}
+
+fn list<'a>(repo: rdedup::Repo, name: String, args: &clap::ArgMatches<'a>) -> Result<()> {
+    let decrypt = repo.unlock_decrypt(&|| {
+        println!("Enter passprase: ");
+        rpassword::read_password()
+    }).context("failed to decrypt rdedup repo")?;
+
+    // TODO: Random access
+    let mut meta = Vec::new();
+    repo.read(&(name + "-meta"), &mut meta, &decrypt)?;
+
+    let root_size = bincode::serialized_size(&(0u64, 0u64));
+    let (offset, files): (u64, u64) = bincode::deserialize(&meta[meta.len()-(root_size as usize)..]).unwrap();
+    let path = args.value_of("PATH").unwrap_or("");
+    list_inner(&meta, path.as_bytes(), meta::Entry {
+        name: b"/".to_vec().into_boxed_slice(),
+        data: meta::Data::Directory { offset, files },
+    })
+}
+
+fn list_inner(meta: &[u8], path: &[u8], base: meta::Entry) -> Result<()> {
+    if path.is_empty() {
+        match base.data {
+            meta::Data::Directory { offset, files } => {
+                let mut dir = &meta[offset as usize..];
+                for _ in 0..files {
+                    let entry: meta::Entry = bincode::deserialize_from(&mut dir, bincode::Infinite).unwrap();
+                    match entry.data {
+                        meta::Data::Directory { .. } => println!("{}/", String::from_utf8_lossy(&entry.name)),
+                        meta::Data::Regular { len, .. } => println!("{}\t{}B", String::from_utf8_lossy(&entry.name), yapb::prefix::Binary(len as f64)),
+                        meta::Data::Link { target } => println!("{}\t-> {}", String::from_utf8_lossy(&base.name), String::from_utf8_lossy(&target)),
+                    }
+                }
+            }
+            meta::Data::Regular { len, .. } => println!("{}\t{}B", String::from_utf8_lossy(&base.name), yapb::prefix::Binary(len as f64)),
+            meta::Data::Link { target } => println!("{}\t-> {}", String::from_utf8_lossy(&base.name), String::from_utf8_lossy(&target)),
+        }
+        Ok(())
+    } else {
+        match base.data {
+            meta::Data::Directory { offset, files } => {
+                let delim = path.iter().position(|&x| x == b'/').unwrap_or(path.len());
+                let name = &path[0..delim];
+                let mut dir = &meta[offset as usize..];
+                for _ in 0..files {
+                    let entry: meta::Entry = bincode::deserialize_from(&mut dir, bincode::Infinite).unwrap();
+                    if &*entry.name == name {
+                        return list_inner(meta, &path[cmp::min(path.len(), delim+1)..], entry);
+                    }
+                }
+                bail!("{}: no such file or directory", String::from_utf8_lossy(name));
+            }
+            _ => { bail!("{} is not a directory", String::from_utf8_lossy(&base.name)); }
         }
     }
 }
